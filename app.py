@@ -20,6 +20,7 @@ HEADERS = {
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".m4v", ".mov", ".m3u8", ".mpd")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg")
+VIDEO_MIMES = ("video/", "application/vnd.apple.mpegurl", "application/x-mpegurl", "application/dash+xml")
 
 
 def clean(value):
@@ -76,15 +77,18 @@ def get_tags(soup):
 def looks_like_video(url, mime=""):
     if not url:
         return False
-    value = url.lower().split("?", 1)[0]
-    mime = (mime or "").lower()
-    if any(value.endswith(ext) for ext in IMAGE_EXTENSIONS):
+    value = url.lower().split("#", 1)[0]
+    path = value.split("?", 1)[0]
+    mime = (mime or "").lower().split(";", 1)[0].strip()
+    if any(path.endswith(ext) for ext in IMAGE_EXTENSIONS):
         return False
-    return "video/" in mime or any(ext in value for ext in VIDEO_EXTENSIONS)
+    if any(mime.startswith(x) for x in VIDEO_MIMES):
+        return True
+    return any(ext in path for ext in VIDEO_EXTENSIONS)
 
 
 def add_video(videos, url, page_url, thumbnail=None, title=None, description=None,
-              category=None, categories=None, tags=None, source="html", mime=None):
+              category=None, categories=None, tags=None, source="html", mime=None, status=None):
     if not url:
         return
     url = absolute(url, page_url)
@@ -102,14 +106,17 @@ def add_video(videos, url, page_url, thumbnail=None, title=None, description=Non
         "source": source,
         "mime_type": mime,
     }
+    if status is not None:
+        item["http_status"] = status
 
     for old in videos:
         if old["video_url"] == url:
-            # Keep the more informative source/mime when a URL is found twice.
             if old.get("source") == "html" and source != "html":
                 old["source"] = source
             if not old.get("mime_type") and mime:
                 old["mime_type"] = mime
+            if old.get("http_status") is None and status is not None:
+                old["http_status"] = status
             return
     videos.append(item)
 
@@ -121,11 +128,9 @@ def extract_jsonld(soup, page_url, videos, page_title, page_description, page_th
             data = json.loads(script.string or script.get_text())
         except Exception:
             continue
-
         objects = data if isinstance(data, list) else [data]
         if isinstance(data, dict) and isinstance(data.get("@graph"), list):
             objects += data["@graph"]
-
         for obj in objects:
             if not isinstance(obj, dict):
                 continue
@@ -133,19 +138,36 @@ def extract_jsonld(soup, page_url, videos, page_title, page_description, page_th
             types = obj_type if isinstance(obj_type, list) else [obj_type]
             if "VideoObject" not in types:
                 continue
-
             video_url = obj.get("contentUrl") or obj.get("embedUrl") or obj.get("url")
             thumbnail = obj.get("thumbnailUrl") or page_thumbnail
             if isinstance(thumbnail, list):
                 thumbnail = thumbnail[0] if thumbnail else None
+            add_video(videos, video_url, page_url, absolute(thumbnail, page_url),
+                      obj.get("name") or page_title, obj.get("description") or page_description,
+                      category, categories, tags, source="jsonld")
 
-            add_video(
-                videos, video_url, page_url,
-                absolute(thumbnail, page_url),
-                obj.get("name") or page_title,
-                obj.get("description") or page_description,
-                category, categories, tags, source="jsonld"
-            )
+
+def scan_text_for_video_urls(text, page_url):
+    if not text:
+        return []
+    # Handles JSON/JS escaped URLs as well as ordinary URLs.
+    candidates = set()
+    patterns = [
+        r'https?://[^\s"\'<>\\]+',
+        r'(?:(?:src|file|url|source|video|contentUrl)\s*[:=]\s*["\'])((?:https?:)?//[^"\']+)',
+        r'["\']([^"\']+\.(?:mp4|webm|m4v|mov|m3u8|mpd)(?:\?[^"\']*)?)["\']',
+    ]
+    for pattern in patterns:
+        try:
+            for m in re.findall(pattern, text, flags=re.I):
+                if isinstance(m, tuple):
+                    m = next((x for x in m if x), "")
+                m = m.replace("\\/", "/").replace("\\u0026", "&")
+                if looks_like_video(m):
+                    candidates.add(absolute(m, page_url))
+        except re.error:
+            pass
+    return [x for x in candidates if x]
 
 
 def extract_from_html(html, page_url):
@@ -169,10 +191,8 @@ def extract_from_html(html, page_url):
                   video_title, description, category, categories, tags, source="html")
 
     for source in soup.find_all("source"):
-        src = source.get("src")
-        if looks_like_video(src, source.get("type")):
-            add_video(videos, src, page_url, thumbnail, title, description,
-                      category, categories, tags, source="html", mime=source.get("type"))
+        add_video(videos, source.get("src"), page_url, thumbnail, title, description,
+                  category, categories, tags, source="html", mime=source.get("type"))
 
     for key in ("og:video", "og:video:url", "og:video:secure_url"):
         value = meta(soup, key)
@@ -184,7 +204,7 @@ def extract_from_html(html, page_url):
                    category, categories, tags)
 
     attributes = ("data-video", "data-video-url", "data-video-src", "data-src",
-                  "data-file", "data-video-file", "data-source")
+                  "data-file", "data-video-file", "data-source", "data-url", "data-media")
     for element in soup.find_all():
         for attr in attributes:
             value = element.get(attr)
@@ -192,31 +212,22 @@ def extract_from_html(html, page_url):
                 add_video(videos, value, page_url, thumbnail, title, description,
                           category, categories, tags, source="data-attribute")
 
-    # Also scan inline scripts for obvious MP4/HLS/DASH URLs.
     for script in soup.find_all("script"):
         text = script.string or script.get_text(" ", strip=False) or ""
-        for match in re.findall(r'https?[^\"\'<>\\\s]+(?:\\/|/)[^\"\'<>\\\s]+', text):
-            candidate = match.replace("\\/", "/").replace("\\u0026", "&")
-            if looks_like_video(candidate):
-                add_video(videos, candidate, page_url, thumbnail, title, description,
-                          category, categories, tags, source="inline-script")
+        for candidate in scan_text_for_video_urls(text, page_url):
+            add_video(videos, candidate, page_url, thumbnail, title, description,
+                      category, categories, tags, source="inline-script")
 
     return {
-        "title": title,
-        "description": description,
-        "thumbnail": thumbnail,
-        "category": category,
-        "categories": categories,
-        "tags": tags,
-        "videos": videos,
+        "title": title, "description": description, "thumbnail": thumbnail,
+        "category": category, "categories": categories, "tags": tags, "videos": videos,
     }
 
 
 def extract_with_playwright(page_url, base_result):
-    """Render JS and capture media network requests.
+    """Render a public page and observe media URLs requested by the browser.
 
-    This only observes resources requested by the public page. It does not bypass
-    authentication, DRM, paywalls, or anti-bot controls.
+    This does not bypass login, DRM, paywalls, or anti-bot protections.
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -226,46 +237,89 @@ def extract_with_playwright(page_url, base_result):
     captured = []
     seen = set()
 
-    def add_response(response):
-        try:
-            request_url = response.url
-            headers = response.headers
-            content_type = headers.get("content-type", "")
-            resource_type = response.request.resource_type
-            if resource_type in ("media", "manifest") or looks_like_video(request_url, content_type):
-                key = request_url.split("#", 1)[0]
-                if key not in seen:
-                    seen.add(key)
-                    captured.append({
-                        "url": key,
-                        "mime": content_type.split(";", 1)[0].strip(),
-                        "resource_type": resource_type,
-                    })
-        except Exception:
-            pass
+    def capture(url, mime="", resource_type="", status=None, source="network"):
+        if not url:
+            return
+        url = url.strip().replace("\\/", "/").replace("\\u0026", "&")
+        if not looks_like_video(url, mime) and resource_type not in ("media", "manifest"):
+            return
+        key = url.split("#", 1)[0]
+        if key in seen:
+            return
+        seen.add(key)
+        captured.append({"url": key, "mime": mime, "resource_type": resource_type,
+                         "status": status, "source": source})
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
-                user_agent=HEADERS["User-Agent"],
-                locale="en-US",
+                user_agent=HEADERS["User-Agent"], locale="en-US",
                 viewport={"width": 1365, "height": 900},
                 extra_http_headers={"Accept-Language": HEADERS["Accept-Language"]},
             )
+
+            def on_request(req):
+                try:
+                    capture(req.url, req.headers.get("accept", ""), req.resource_type,
+                            source="network-request")
+                except Exception:
+                    pass
+
+            def on_response(resp):
+                try:
+                    capture(resp.url, resp.headers.get("content-type", ""),
+                            resp.request.resource_type, resp.status, source="network-response")
+                except Exception:
+                    pass
+
+            context.on("request", on_request)
+            context.on("response", on_response)
+
             page = context.new_page()
-            page.on("response", add_response)
+            page.on("request", on_request)
+            page.on("response", on_response)
+
             page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
             try:
                 page.wait_for_load_state("networkidle", timeout=10000)
             except PlaywrightTimeoutError:
                 pass
 
-            # Give lazy video players a short opportunity to initialize.
-            page.wait_for_timeout(2500)
+            # Some players don't request media until they are interacted with.
+            try:
+                page.locator("video").first.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+            try:
+                page.locator("video").first.evaluate("v => { try { v.muted=true; v.play().catch(()=>{}); } catch(e){} }")
+            except Exception:
+                pass
+            try:
+                page.locator("button[aria-label*='play' i], .play, .vjs-play-control, .jw-icon-play").first.click(timeout=2500)
+            except Exception:
+                pass
 
-            # Inspect the rendered DOM too. Some players insert <source>/<video>
-            # only after JavaScript runs.
+            # Inspect every frame for dynamically inserted video elements and performance entries.
+            for frame in page.frames:
+                try:
+                    urls = frame.evaluate("""() => {
+                        const out = [];
+                        document.querySelectorAll('video,source').forEach(e => {
+                          ['src','currentSrc'].forEach(k => { if (e[k]) out.push(e[k]); });
+                          ['data-src','data-video','data-video-url','data-video-src','data-file'].forEach(k => {
+                            if (e.getAttribute(k)) out.push(e.getAttribute(k));
+                          });
+                        });
+                        try { performance.getEntriesByType('resource').forEach(e => out.push(e.name)); } catch(e) {}
+                        return out;
+                    }""")
+                    for u in urls or []:
+                        capture(u, "", "", source="dom-performance")
+                except Exception:
+                    pass
+
+            page.wait_for_timeout(3000)
             rendered_html = page.content()
             rendered = extract_from_html(rendered_html, page.url)
             base_result["title"] = base_result.get("title") or rendered.get("title")
@@ -284,65 +338,47 @@ def extract_with_playwright(page_url, base_result):
 def fetch_html(page_url):
     response = requests.get(page_url, headers=HEADERS, timeout=30, allow_redirects=True)
     if response.status_code == 403:
-        return None, {
-            "success": False,
-            "error": "Target website returned HTTP 403",
-            "message": "The website refused the direct automated request. Browser rendering may still work if the page is publicly accessible."
-        }, 403
+        return None, {"success": False, "error": "Target website returned HTTP 403",
+                       "message": "Direct HTML fetch was refused; browser extraction will still be attempted."}, 403
     response.raise_for_status()
     return response.text, None, 200
 
 
 def extract_page(page_url, use_browser=True):
     html, error, status = fetch_html(page_url)
-
     if html is not None:
         result = extract_from_html(html, page_url)
     else:
-        result = {
-            "title": None, "description": None, "thumbnail": None,
-            "category": None, "categories": [], "tags": [], "videos": []
-        }
+        result = {"title": None, "description": None, "thumbnail": None,
+                  "category": None, "categories": [], "tags": [], "videos": []}
 
     browser_error = None
     captured = []
-
-    # Browser extraction is the important fallback for JS-generated players.
     if use_browser:
         captured, browser_error = extract_with_playwright(page_url, result)
         for media in captured:
-            add_video(
-                result["videos"], media["url"], page_url,
-                result["thumbnail"], result["title"], result["description"],
-                result["category"], result["categories"], result["tags"],
-                source="network", mime=media["mime"]
-            )
+            add_video(result["videos"], media["url"], page_url,
+                      result["thumbnail"], result["title"], result["description"],
+                      result["category"], result["categories"], result["tags"],
+                      source=media["source"], mime=media["mime"], status=media["status"])
 
-    if html is None and not result["videos"]:
-        if browser_error:
-            error["browser_error"] = browser_error
-        return error, status
+    if not result["videos"]:
+        details = {"success": False,
+                   "error": "No video URL found",
+                   "message": "No public MP4/HLS/DASH media URL was exposed by the HTML or browser network/DOM inspection.",
+                   "extraction": {"html": html is not None, "browser": use_browser,
+                                  "network_requests": len(captured), "browser_error": browser_error}}
+        if error:
+            details.update({k: v for k, v in error.items() if k != "success"})
+        return details, status if status != 200 else 404
 
-    return {
-        "success": True,
-        "source": page_url,
-        "page": {
-            "title": result["title"],
-            "description": result["description"],
-            "thumbnail": result["thumbnail"],
-            "category": result["category"],
-            "categories": result["categories"],
-            "tags": result["tags"],
-        },
-        "count": len(result["videos"]),
-        "videos": result["videos"],
-        "extraction": {
-            "html": html is not None,
-            "browser": use_browser,
-            "network_requests": len(captured),
-            "browser_error": browser_error,
-        },
-    }, 200
+    return {"success": True, "source": page_url,
+            "page": {"title": result["title"], "description": result["description"],
+                     "thumbnail": result["thumbnail"], "category": result["category"],
+                     "categories": result["categories"], "tags": result["tags"]},
+            "count": len(result["videos"]), "videos": result["videos"],
+            "extraction": {"html": html is not None, "browser": use_browser,
+                           "network_requests": len(captured), "browser_error": browser_error}}, 200
 
 
 @app.route("/")
@@ -354,12 +390,10 @@ def home():
 def api_extract():
     url = request.args.get("url", "").strip()
     browser = request.args.get("browser", "1").lower() not in ("0", "false", "no")
-
     if not url:
         return jsonify({"success": False, "error": "Missing url parameter"}), 400
     if not url.startswith(("http://", "https://")):
         return jsonify({"success": False, "error": "Invalid URL"}), 400
-
     try:
         result, status = extract_page(url, use_browser=browser)
         return jsonify(result), status
