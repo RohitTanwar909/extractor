@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Video URL Extractor</title>
+<style>
+body{font-family:Arial,sans-serif;max-width:900px;margin:40px auto;padding:20px;background:#f5f5f5}
+.box{background:#fff;padding:25px;border-radius:14px;box-shadow:0 4px 18px #0001}
+input{width:100%;box-sizing:border-box;padding:14px;border:1px solid #ccc;border-radius:8px;font-size:16px}
+button{margin-top:12px;padding:12px 20px;border:0;border-radius:8px;background:#111;color:#fff;font-size:16px;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}
+.item{background:#f0f0f0;padding:12px;margin:8px 0;border-radius:8px;word-break:break-all}
+.small{color:#666}.source{font-size:12px;color:#666;margin-top:5px}
+</style>
+</head>
+<body>
+<div class="box">
+<h1>Video URL Extractor</h1>
+<p class="small">HTML + JavaScript/browser network extraction for publicly accessible pages.</p>
+<input id="url" placeholder="https://example.com/page">
+<button id="btn" onclick="extract()">Extract Video URLs</button>
+<div id="out"></div>
+</div>
+<script>
+async function extract(){
+ const input=document.getElementById('url'),btn=document.getElementById('btn'),out=document.getElementById('out');
+ const u=input.value.trim();
+ if(!u){out.innerHTML='<p>Enter a URL.</p>';return;}
+ btn.disabled=true; out.innerHTML='<p>Extracting HTML and browser/network sources...</p>';
+ try{
+  const r=await fetch('/api/extract?browser=1&url='+encodeURIComponent(u));
+  const d=await r.json();
+  if(!r.ok||!d.success){out.innerHTML='<p>Error: '+escapeHtml(d.error||'Unknown error')+'</p><pre>'+escapeHtml(JSON.stringify(d,null,2))+'</pre>';return;}
+  if(!d.videos.length){out.innerHTML='<p>No video URL found. The player may require authentication, DRM, or another unsupported mechanism.</p>';return;}
+  out.innerHTML='<h3>Found '+d.count+' video URL(s)</h3>'+d.videos.map((v,i)=>
+   '<div class="item"><b>'+(i+1)+'.</b> <a href="'+escapeAttr(v.video_url)+'" target="_blank" rel="noopener">'+escapeHtml(v.video_url)+'</a>'+
+   '<div class="source">Source: '+escapeHtml(v.source||'unknown')+(v.mime_type?' · '+escapeHtml(v.mime_type):'')+'</div></div>'
+  ).join('')+'<details><summary>Extraction details</summary><pre>'+escapeHtml(JSON.stringify(d.extraction,null,2))+'</pre></details>';
+ }catch(e){out.innerHTML='<p>Error: '+escapeHtml(e.message)+'</p>'}
+ finally{btn.disabled=false}
+}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function escapeAttr(s){return escapeHtml(s)}
+</script>
+</body>
+</html>
